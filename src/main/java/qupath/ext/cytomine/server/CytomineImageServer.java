@@ -20,7 +20,9 @@ package qupath.ext.cytomine.server;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import qupath.ext.cytomine.client.CytomineAuthException;
 import qupath.ext.cytomine.client.CytomineClient;
+import qupath.ext.cytomine.client.CytomineClients;
 import qupath.ext.cytomine.client.CytomineObjects;
 import qupath.ext.cytomine.client.CytomineObjects.ImageInstance;
 import qupath.ext.cytomine.client.CytomineUrls;
@@ -164,6 +166,9 @@ public class CytomineImageServer extends AbstractTileableImageServer {
 			try {
 				client.getBytes(tilePath(0, 0, 0, channelQuery + "zSlices=0&timepoints=0"), "image/jpeg");
 				return channelQuery;
+			} catch (CytomineAuthException e) {
+				// Not a problem with this way of requesting tiles
+				throw e;
 			} catch (IOException e) {
 				lastError = e;
 				logger.debug("Tile request '{}' rejected by Cytomine for {}: {}", channelQuery, uri, e.getMessage());
@@ -192,9 +197,15 @@ public class CytomineImageServer extends AbstractTileableImageServer {
 		int tx = tileRequest.getTileX() / TILE_SIZE;
 		int ty = tileRequest.getTileY() / TILE_SIZE;
 		var plane = "zSlices=" + tileRequest.getZ() + "&timepoints=" + tileRequest.getT();
-		if (image.isRGB())
-			return readRgbTile(tilePath(zoom, tx, ty, rgbChannelQuery + plane));
-		return readChannelTiles(zoom, tx, ty, plane);
+		try {
+			if (image.isRGB())
+				return readRgbTile(tilePath(zoom, tx, ty, rgbChannelQuery + plane));
+			return readChannelTiles(zoom, tx, ty, plane);
+		} catch (CytomineAuthException e) {
+			// Tiles are read in the background: the user would otherwise only see a blank viewer
+			CytomineClients.reportAuthFailure(client, e);
+			throw e;
+		}
 	}
 
 	private BufferedImage readRgbTile(String path) throws IOException {

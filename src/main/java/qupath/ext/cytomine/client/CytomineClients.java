@@ -19,6 +19,7 @@
 package qupath.ext.cytomine.client;
 
 import javafx.application.Platform;
+import qupath.fx.dialogs.Dialogs;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.ext.cytomine.ui.CytomineLoginDialog;
@@ -30,6 +31,7 @@ import java.util.Collection;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Optional;
+import java.util.ResourceBundle;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
@@ -38,7 +40,8 @@ import java.util.prefs.Preferences;
 /**
  * Registry of the authenticated clients, keyed by core API URL.
  * <p>
- * Only non-sensitive settings (server URLs and last username) are persisted. Passwords and tokens are not.
+ * Only non-sensitive settings (server URLs and last username) are persisted. Passwords and tokens are not: they only
+ * live in memory, in the {@link CytomineClient}, until the user logs out.
  */
 public final class CytomineClients {
 
@@ -48,6 +51,8 @@ public final class CytomineClients {
 	private static final String KEY_LAST_SERVER = "lastServer";
 	private static final String KEY_LAST_USERNAME = "lastUsername";
 	private static final String KEY_IAM_PREFIX = "iam.";
+
+	private static final ResourceBundle resources = ResourceBundle.getBundle("qupath.ext.cytomine.ui.strings");
 
 	private static final Map<String, CytomineClient> clients = new ConcurrentHashMap<>();
 
@@ -60,6 +65,21 @@ public final class CytomineClients {
 	 */
 	public static Optional<CytomineClient> get(String coreUrl) {
 		return Optional.ofNullable(clients.get(CytomineUrls.normalizeCoreUrl(coreUrl)));
+	}
+
+	/**
+	 * Get a client that is already logged in, without prompting: the one for the server of the last login if there is
+	 * one, otherwise any other. Clients that can no longer renew their session are ignored.
+	 * @return the client, if any
+	 */
+	public static Optional<CytomineClient> getActive() {
+		var last = getLastServer();
+		if (!last.isBlank()) {
+			var client = get(last).filter(c -> !c.needsLogin());
+			if (client.isPresent())
+				return client;
+		}
+		return clients.values().stream().filter(c -> !c.needsLogin()).findFirst();
 	}
 
 	/**
@@ -82,11 +102,13 @@ public final class CytomineClients {
 	}
 
 	/**
-	 * Forget the client for a server. Tokens are discarded with the client.
+	 * Forget the client for a server, and the tokens and password it holds.
 	 * @param coreUrl URL of the core API
 	 */
 	public static void remove(String coreUrl) {
-		clients.remove(CytomineUrls.normalizeCoreUrl(coreUrl));
+		var removed = clients.remove(CytomineUrls.normalizeCoreUrl(coreUrl));
+		if (removed != null)
+			removed.logout();
 	}
 
 	/**
@@ -122,7 +144,8 @@ public final class CytomineClients {
 	 */
 	public static Optional<CytomineClient> getOrLogin(String coreUrl) {
 		if (coreUrl != null) {
-			var existing = get(coreUrl);
+			// A client that can no longer renew its session (password refused) is replaced by a new login
+			var existing = get(coreUrl).filter(c -> !c.needsLogin());
 			if (existing.isPresent())
 				return existing;
 		}
@@ -138,6 +161,22 @@ public final class CytomineClients {
 			logger.error("Login dialog failed", e);
 		}
 		return Optional.empty();
+	}
+
+	/**
+	 * Tell the user that the session could not be renewed, e.g. from a background thread that failed to read a tile.
+	 * The message is only shown once for a client, until its next successful authentication.
+	 * May be called from any thread.
+	 * @param client the client whose session could not be renewed
+	 * @param e the failure, whose message is shown to the user
+	 */
+	public static void reportAuthFailure(CytomineClient client, CytomineAuthException e) {
+		if (!client.claimAuthFailureReport())
+			return;
+		logger.error("Unable to renew the Cytomine session", e);
+		var title = resources.getString("session.error.title");
+		var message = e.getLocalizedMessage();
+		Platform.runLater(() -> Dialogs.showErrorMessage(title, message));
 	}
 
 	private static String key(String s) {

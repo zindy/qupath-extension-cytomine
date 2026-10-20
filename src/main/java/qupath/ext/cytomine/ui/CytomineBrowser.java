@@ -43,6 +43,7 @@ import org.slf4j.LoggerFactory;
 import qupath.ext.cytomine.project.CytomineProjectSync;
 import qupath.ext.cytomine.project.CytomineProjectSync.Link;
 import qupath.ext.cytomine.project.CytomineProjectSync.Result;
+import qupath.ext.cytomine.client.CytomineAuthException;
 import qupath.ext.cytomine.client.CytomineClient;
 import qupath.ext.cytomine.client.CytomineClients;
 import qupath.ext.cytomine.client.CytomineObjects;
@@ -89,19 +90,27 @@ public class CytomineBrowser {
 	}
 
 	/**
-	 * Show the window, prompting to log in if necessary.
+	 * Show the window. If the user is already logged in (e.g. to open the images of a project), the browser uses that
+	 * session; otherwise it prompts to log in.
 	 */
 	public void show() {
-		if (client == null)
-			connect();
+		if (client == null) {
+			var existing = CytomineClients.getActive();
+			if (existing.isPresent())
+				use(existing.get());
+			else
+				connect();
+		}
 		stage.show();
 		stage.toFront();
 	}
 
+	// Always prompts, to log in to another server or as another user
 	private void connect() {
-		var newClient = CytomineClients.getOrLogin(null).orElse(null);
-		if (newClient == null)
-			return;
+		CytomineClients.getOrLogin(null).ifPresent(this::use);
+	}
+
+	private void use(CytomineClient newClient) {
 		client = newClient;
 		serverLabel.setText(client.getUsername() + " @ " + client.getCoreUri());
 		loadProjects();
@@ -321,6 +330,9 @@ public class CytomineBrowser {
 			var ex = task.getException();
 			logger.error("Cytomine request failed", ex);
 			statusLabel.setText(ex.getLocalizedMessage());
+			// The status line is easy to miss, and this is not something that retrying the request will fix
+			if (ex instanceof CytomineAuthException)
+				Dialogs.showErrorMessage(resources.getString("error"), ex.getLocalizedMessage());
 		});
 		var thread = new Thread(task, "cytomine-request");
 		thread.setDaemon(true);

@@ -20,6 +20,7 @@ package qupath.ext.cytomine.server;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import qupath.ext.cytomine.client.CytomineAuthException;
 import qupath.ext.cytomine.client.CytomineClients;
 import qupath.ext.cytomine.client.CytomineUrls;
 import qupath.lib.images.servers.ImageServer;
@@ -57,6 +58,9 @@ public class CytomineImageServerBuilder implements ImageServerBuilder<BufferedIm
 				return UriImageSupport.createInstance(this.getClass(), 4f, server.getBuilder());
 		} catch (Exception e) {
 			logger.warn("Unable to open Cytomine image {}: {}", uri, e.getMessage());
+			// Otherwise the image would simply be reported as unsupported
+			if (e instanceof CytomineAuthException authError)
+				CytomineClients.get(CytomineUrls.coreUrl(uri)).ifPresent(c -> CytomineClients.reportAuthFailure(c, authError));
 		}
 		return UriImageSupport.createInstance(this.getClass(), 0f, java.util.List.of());
 	}

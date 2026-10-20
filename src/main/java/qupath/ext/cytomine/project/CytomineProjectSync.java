@@ -22,6 +22,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import qupath.ext.cytomine.client.CytomineAuthException;
 import qupath.ext.cytomine.client.CytomineClient;
 import qupath.ext.cytomine.client.CytomineObjects;
 import qupath.ext.cytomine.client.CytomineObjects.ImageInstance;
@@ -213,6 +214,8 @@ public final class CytomineProjectSync {
 			var thumbnail = CytomineObjects.getThumbnail(client, image.id(), THUMBNAIL_SIZE);
 			if (thumbnail != null)
 				entry.setThumbnail(thumbnail);
+		} catch (CytomineAuthException e) {
+			throw e;
 		} catch (IOException e) {
 			logger.debug("No thumbnail for {}: {}", image.name(), e.getMessage());
 		}

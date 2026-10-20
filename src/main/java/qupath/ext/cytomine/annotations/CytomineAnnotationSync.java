@@ -21,6 +21,7 @@ package qupath.ext.cytomine.annotations;
 import qupath.ext.cytomine.client.CytomineAnnotations;
 import qupath.ext.cytomine.client.CytomineAnnotations.RemoteAnnotation;
 import qupath.ext.cytomine.client.CytomineAnnotations.Term;
+import qupath.ext.cytomine.client.CytomineAuthException;
 import qupath.ext.cytomine.client.CytomineClient;
 import qupath.ext.cytomine.client.CytomineObjects;
 import qupath.ext.cytomine.client.CytomineUrls;
@@ -174,6 +175,9 @@ public class CytomineAnnotationSync {
 						report.updated++;
 					}
 				}
+			} catch (CytomineAuthException e) {
+				// Stop, rather than reporting every annotation as a separate warning
+				throw e;
 			} catch (IOException e) {
 				report.warnings.add("Annotation " + r.id() + ": " + e.getMessage());
 			}
@@ -233,6 +237,8 @@ public class CytomineAnnotationSync {
 				synced.add(id);
 				if (isModified(obj))
 					updateRemote(obj, id, report);
+			} catch (CytomineAuthException e) {
+				throw e;
 			} catch (IOException | RuntimeException e) {
 				report.warnings.add(describe(obj) + ": " + e.getMessage());
 			}
@@ -250,6 +256,8 @@ public class CytomineAnnotationSync {
 					CytomineAnnotations.delete(client, id);
 					report.deleted++;
 				}
+			} catch (CytomineAuthException e) {
+				throw e;
 			} catch (IOException e) {
 				report.warnings.add("Annotation " + id + " could not be deleted: " + e.getMessage());
 			}
@@ -274,6 +282,9 @@ public class CytomineAnnotationSync {
 		RemoteAnnotation remote;
 		try {
 			remote = CytomineAnnotations.get(client, id);
+		} catch (CytomineAuthException e) {
+			// Not the same thing as an annotation deleted in Cytomine
+			throw e;
 		} catch (IOException e) {
 			report.conflicts.add(describe(obj) + " no longer exists in Cytomine (pull to refresh)");
 			return;
