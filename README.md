@@ -11,6 +11,8 @@ Open and manage images stored in a [Cytomine](https://cytomine.org) server from 
 - One QuPath project per Cytomine project: *New QuPath project...* creates a QuPath project with one entry per
 Cytomine image, and *Sync QuPath project* adds new Cytomine images, follows renames, and (after confirmation) removes
 entries whose image was deleted from Cytomine. Existing entries and their annotations are kept.
+- Tags and properties of the Cytomine images are copied to the project entries when the project is synchronized (see
+  [Tags and properties](#tags-and-properties)). This is read-only: nothing is written back to Cytomine.
 - Two-way annotation sync for the image in the viewer (*Extensions > Cytomine > Pull / Push annotations*). Your
   annotations can be edited in QuPath and pushed back; other users' annotations are pulled as locked objects named after
   their author. Ontology terms become QuPath classes, and new classes are created as terms. If an annotation changed on
@@ -21,6 +23,18 @@ entries whose image was deleted from Cytomine. Existing entries and their annota
 
 Enter the URL of the Cytomine web interface (e.g. `http://127.0.0.1`). The extension reads the API and Keycloak URLs from
 its `/configuration.json`; they can also be entered explicitly (e.g. `http://127.0.0.1:8100/iam/realms/cytomine`).
+
+## Tags and properties
+
+*Sync QuPath project* also reads the tags and the properties (key/value pairs) of each image in Cytomine:
+
+- Properties become metadata of the entry, named `Cytomine: <key>`. Properties removed in Cytomine are removed from the
+  entry. If a key is repeated, the values are joined with `; `.
+- Tags are added to the entry's tags (so they can be used to filter the image list). A tag that was copied from Cytomine
+  and is later removed there is removed from the entry. Tags you added in QuPath are never removed, and neither is any
+  other metadata. The tags last copied are remembered in the entry metadata `Cytomine tags`.
+- If they cannot be read for an image, that entry is left unchanged, and the summary says how many were affected (details
+  in the log). After 3 failures in a row, the rest of that synchronization skips them.
 
 ## Sessions and passwords
 

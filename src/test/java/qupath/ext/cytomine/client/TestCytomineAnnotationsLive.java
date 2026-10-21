@@ -78,6 +78,27 @@ class TestCytomineAnnotationsLive {
 			var again = sync.push(false);
 			assertEquals(0, again.created + again.pushed + again.deleted);
 
+			// Measurements are sent as properties, only when they change
+			try (var list = obj2.getMeasurementList()) {
+				list.put("Test measurement", 42.5);
+			}
+			var withMeasurements = sync.push(false);
+			assertEquals(1, withMeasurements.measurementsPushed, withMeasurements.summary());
+			var obj2Id = Long.parseLong(obj2.getMetadata().get("Cytomine ID"));
+			var properties = CytomineObjects.listAll(client,
+					"domain/be.cytomine.domain.ontology.UserAnnotation/" + obj2Id + "/property.json");
+			assertEquals(1, properties.size());
+			assertEquals("QuPath: Test measurement", properties.get(0).get("key").getAsString());
+			assertEquals(0, sync.push(false).measurementsPushed);
+
+			// Deleted in Cytomine, still in QuPath: created again on push, with its measurements
+			CytomineAnnotations.delete(client, obj2Id);
+			var recreated = sync.push(false);
+			assertEquals(1, recreated.created, recreated.summary());
+			assertEquals(1, recreated.measurementsPushed);
+			assertNotEquals(Long.toString(obj2Id), obj2.getMetadata().get("Cytomine ID"));
+			assertEquals(before + 2, CytomineAnnotations.list(client, image.id()).size());
+
 			// Geometry and class change
 			var moved = PathObjects.createAnnotationObject(
 					ROIs.createRectangleROI(2100, 3100, 400, 300, ImagePlane.getDefaultPlane()), PathClass.fromString("Stroma"));

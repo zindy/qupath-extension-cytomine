@@ -35,6 +35,8 @@ import java.util.Map;
  */
 public final class CytomineAnnotations {
 
+	private static final String ANNOTATION_CLASS = "be.cytomine.domain.ontology.UserAnnotation";
+
 	private CytomineAnnotations() {}
 
 	/**
@@ -176,6 +178,59 @@ public final class CytomineAnnotations {
 	 */
 	public static void delete(CytomineClient client, long id) throws IOException {
 		client.sendJson("DELETE", "userannotation/" + id + ".json", null);
+	}
+
+	/**
+	 * Make the properties of an annotation whose key starts with a prefix match the given values. Properties
+	 * with other keys (added in Cytomine) are left alone.
+	 * @param client the client
+	 * @param annotationId annotation id
+	 * @param prefix prefix of the keys that are managed
+	 * @param wanted the properties that should exist, by key; each key must start with the prefix
+	 * @return the number of properties created, changed or deleted
+	 * @throws IOException if a request fails
+	 */
+	public static int setProperties(CytomineClient client, long annotationId, String prefix, Map<String, String> wanted)
+			throws IOException {
+		var base = "domain/" + ANNOTATION_CLASS + "/" + annotationId + "/property";
+		var existing = new HashMap<String, JsonObject>();
+		var obsolete = new ArrayList<JsonObject>();
+		for (var json : CytomineObjects.listAll(client, base + ".json")) {
+			var key = json.get("key");
+			if (key == null || key.isJsonNull() || !key.getAsString().startsWith(prefix))
+				continue;
+			if (existing.putIfAbsent(key.getAsString(), json) != null)
+				obsolete.add(json);
+		}
+		int changes = 0;
+		for (var entry : wanted.entrySet()) {
+			var current = existing.remove(entry.getKey());
+			var body = new JsonObject();
+			body.addProperty("key", entry.getKey());
+			body.addProperty("value", entry.getValue());
+			body.addProperty("domainIdent", annotationId);
+			body.addProperty("domainClassName", ANNOTATION_CLASS);
+			if (current == null) {
+				client.sendJson("POST", base + ".json", body);
+				changes++;
+			} else if (!entry.getValue().equals(stringOrNull(current, "value"))) {
+				// The server finds the property from the id in the body
+				body.addProperty("id", current.get("id").getAsLong());
+				client.sendJson("PUT", base + "/" + current.get("id").getAsLong() + ".json", body);
+				changes++;
+			}
+		}
+		obsolete.addAll(existing.values());
+		for (var json : obsolete) {
+			client.sendJson("DELETE", base + "/" + json.get("id").getAsLong() + ".json", null);
+			changes++;
+		}
+		return changes;
+	}
+
+	private static String stringOrNull(JsonObject json, String key) {
+		var e = json.get(key);
+		return e == null || e.isJsonNull() ? null : e.getAsString();
 	}
 
 	/**

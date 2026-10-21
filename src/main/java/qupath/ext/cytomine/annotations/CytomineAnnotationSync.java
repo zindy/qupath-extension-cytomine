@@ -55,6 +55,9 @@ import java.util.stream.Collectors;
  * QuPath objects remember the Cytomine annotation they come from (id, last update, a hash of the geometry and the term)
  * in their metadata. This allows detecting what changed on each side since the last synchronization. When an annotation
  * changed on both sides, nothing is overwritten and the conflict is reported.
+ * <p>
+ * The measurements of annotations of the current user are also pushed, as Cytomine properties whose key starts with
+ * {@value #PROPERTY_PREFIX}. This is one-way: they are never pulled back.
  */
 public class CytomineAnnotationSync {
 
@@ -63,6 +66,9 @@ public class CytomineAnnotationSync {
 	static final String KEY_UPDATED = "Cytomine updated";
 	static final String KEY_HASH = "Cytomine geometry hash";
 	static final String KEY_TERM = "Cytomine term";
+	static final String KEY_MEASUREMENTS = "Cytomine measurements hash";
+	// Prefix of the Cytomine properties that hold the measurements of QuPath, to tell them apart from the user's own
+	static final String PROPERTY_PREFIX = "QuPath: ";
 	static final String PROP_SYNCED_IDS = "Cytomine synced annotation IDs";
 
 	/**
@@ -81,6 +87,8 @@ public class CytomineAnnotationSync {
 		public int pushed;
 		/** Annotations deleted in Cytomine. */
 		public int deleted;
+		/** Annotations whose measurements were sent to Cytomine. */
+		public int measurementsPushed;
 		/** Annotations that were not synchronized because they changed on both sides. */
 		public final List<String> conflicts = new ArrayList<>();
 		/** Other problems. */
@@ -93,6 +101,8 @@ public class CytomineAnnotationSync {
 			var sb = new StringBuilder();
 			sb.append(String.format("QuPath: %d added, %d updated, %d removed. Cytomine: %d created, %d updated, %d deleted.",
 					added, updated, removed, created, pushed, deleted));
+			if (measurementsPushed > 0)
+				sb.append(String.format(" Measurements sent for %d annotations.", measurementsPushed));
 			if (!conflicts.isEmpty())
 				sb.append("\n\nConflicts (kept as is):\n- ").append(String.join("\n- ", conflicts));
 			if (!warnings.isEmpty())
@@ -224,6 +234,9 @@ public class CytomineAnnotationSync {
 		var previouslySynced = loadSyncedIds();
 		var synced = new LinkedHashSet<Long>();
 		var plane = ImagePlane.getDefaultPlane();
+		// Annotations deleted in Cytomine since the last synchronization are created again
+		var remoteIds = new HashSet<Long>();
+		CytomineAnnotations.list(client, imageId).forEach(r -> remoteIds.add(r.id()));
 
 		try {
 			for (var obj : new ArrayList<>(imageData.getHierarchy().getAnnotationObjects())) {
@@ -231,14 +244,22 @@ public class CytomineAnnotationSync {
 					continue;
 				try {
 					var idText = obj.getMetadata().get(KEY_ID);
+					if (idText != null && !remoteIds.contains(Long.parseLong(idText))) {
+						previouslySynced.remove(Long.parseLong(idText));
+						forgetRemote(obj);
+						idText = null;
+					}
 					if (idText == null) {
-						synced.add(createRemote(obj, report));
+						long newId = createRemote(obj, report);
+						synced.add(newId);
+						pushMeasurements(obj, newId, report);
 						continue;
 					}
 					long id = Long.parseLong(idText);
 					synced.add(id);
 					if (isModified(obj))
 						updateRemote(obj, id, report);
+					pushMeasurements(obj, id, report);
 				} catch (CytomineAuthException e) {
 					throw e;
 				} catch (IOException | RuntimeException e) {
@@ -282,6 +303,47 @@ public class CytomineAnnotationSync {
 		saveSyncedIds(synced);
 		imageData.setChanged(true);
 		return report;
+	}
+
+	// Measurements are one-way (QuPath to Cytomine): they are computed in QuPath, and Cytomine properties are free text
+	private void pushMeasurements(PathObject obj, long id, Report report) throws IOException {
+		var wanted = measurementsOf(obj);
+		var hash = wanted.isEmpty() ? null : hash(wanted.toString());
+		var previous = obj.getMetadata().get(KEY_MEASUREMENTS);
+		if (Objects.equals(hash, previous))
+			return;
+		try {
+			CytomineAnnotations.setProperties(client, id, PROPERTY_PREFIX, wanted);
+		} catch (CytomineAuthException e) {
+			throw e;
+		} catch (IOException e) {
+			report.warnings.add(describe(obj) + ": measurements not sent: " + e.getMessage());
+			return;
+		}
+		if (hash == null)
+			obj.getMetadata().remove(KEY_MEASUREMENTS);
+		else
+			obj.getMetadata().put(KEY_MEASUREMENTS, hash);
+		report.measurementsPushed++;
+	}
+
+	static Map<String, String> measurementsOf(PathObject obj) {
+		var wanted = new java.util.TreeMap<String, String>();
+		if (!obj.hasMeasurements())
+			return wanted;
+		var list = obj.getMeasurementList();
+		for (var name : list.getMeasurementNames()) {
+			double value = list.get(name);
+			if (!Double.isNaN(value) && !Double.isInfinite(value))
+				wanted.put(PROPERTY_PREFIX + name, Double.toString(value));
+		}
+		return wanted;
+	}
+
+	private static void forgetRemote(PathObject obj) {
+		var metadata = obj.getMetadata();
+		for (var key : List.of(KEY_ID, KEY_UPDATED, KEY_HASH, KEY_TERM, KEY_MEASUREMENTS))
+			metadata.remove(key);
 	}
 
 	private long createRemote(PathObject obj, Report report) throws IOException {

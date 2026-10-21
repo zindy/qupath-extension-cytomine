@@ -24,6 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.ext.cytomine.client.CytomineAuthException;
 import qupath.ext.cytomine.client.CytomineClient;
+import qupath.ext.cytomine.client.CytomineMetadata;
 import qupath.ext.cytomine.client.CytomineObjects;
 import qupath.ext.cytomine.client.CytomineObjects.ImageInstance;
 import qupath.ext.cytomine.client.CytomineUrls;
@@ -41,8 +42,12 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Keeps a QuPath project in step with a Cytomine project: one QuPath entry per Cytomine image.
@@ -57,6 +62,13 @@ public final class CytomineProjectSync {
 	static final String LINK_FILE_NAME = "cytomine-project.json";
 	static final String KEY_IMAGE_ID = "Cytomine image ID";
 	static final String KEY_IMAGE_NAME = "Cytomine image name";
+	// Cytomine properties are copied to the metadata of the entries under this prefix, so that they can be told apart
+	// from what the user adds, and updated or removed when they change in Cytomine
+	static final String KEY_PROPERTY_PREFIX = "Cytomine: ";
+	// The tags last copied from Cytomine (a JSON array), to be able to remove those that are removed in Cytomine
+	// without touching the tags added in QuPath
+	static final String KEY_PULLED_TAGS = "Cytomine tags";
+	private static final int MAX_CONSECUTIVE_METADATA_FAILURES = 3;
 	private static final int THUMBNAIL_SIZE = 256;
 
 	private CytomineProjectSync() {}
@@ -80,8 +92,11 @@ public final class CytomineProjectSync {
 	 * @param renamed number of entries renamed to follow Cytomine
 	 * @param missing entries whose Cytomine image no longer exists in the Cytomine project and were kept
 	 * @param removed number of entries removed
+	 * @param metadataUpdated number of entries whose tags or properties were updated from Cytomine
+	 * @param metadataFailed number of images whose tags and properties could not be read (nothing is changed for them)
 	 */
-	public record Result(List<String> added, int renamed, List<ProjectImageEntry<BufferedImage>> missing, int removed) {}
+	public record Result(List<String> added, int renamed, List<ProjectImageEntry<BufferedImage>> missing, int removed,
+						 int metadataUpdated, int metadataFailed) {}
 
 	/**
 	 * @param project a QuPath project
@@ -177,13 +192,36 @@ public final class CytomineProjectSync {
 
 		var added = new ArrayList<String>();
 		int renamed = 0;
+		int metadataUpdated = 0;
+		int metadataFailed = 0;
+		int consecutiveFailures = 0;
+		boolean metadataAvailable = true;
 		for (var image : images) {
 			var entry = existing.remove(image.id());
 			if (entry == null) {
-				addEntry(project, client, link, image);
+				entry = addEntry(project, client, link, image);
 				added.add(image.name());
 			} else if (rename(entry, image)) {
 				renamed++;
+			}
+			if (!metadataAvailable)
+				continue;
+			try {
+				var tags = CytomineMetadata.listTags(client, image);
+				var properties = CytomineMetadata.listProperties(client, image);
+				if (mergeMetadata(entry.getMetadata(), entry.getTags(), tags, properties))
+					metadataUpdated++;
+				consecutiveFailures = 0;
+			} catch (CytomineAuthException e) {
+				throw e;
+			} catch (IOException | RuntimeException e) {
+				// Nothing is changed for this image: with partial information, tags or properties could wrongly be removed
+				metadataFailed++;
+				logger.warn("Unable to read the tags and properties of {}: {}", image.name(), e.getMessage());
+				if (++consecutiveFailures >= MAX_CONSECUTIVE_METADATA_FAILURES) {
+					logger.warn("Giving up on the tags and properties for this synchronization");
+					metadataAvailable = false;
+				}
 			}
 		}
 
@@ -197,11 +235,11 @@ public final class CytomineProjectSync {
 		}
 		setLink(project, link);
 		project.syncChanges();
-		return new Result(added, renamed, missing, removed);
+		return new Result(added, renamed, missing, removed, metadataUpdated, metadataFailed);
 	}
 
-	private static void addEntry(Project<BufferedImage> project, CytomineClient client, Link link, ImageInstance image)
-			throws IOException {
+	private static ProjectImageEntry<BufferedImage> addEntry(Project<BufferedImage> project, CytomineClient client,
+															 Link link, ImageInstance image) throws IOException {
 		var uri = CytomineUrls.imageUri(link.coreUrl(), image.id());
 		var builder = DefaultImageServerBuilder.createInstance(CytomineImageServerBuilder.class, uri);
 		var entry = project.addImage(builder);
@@ -218,6 +256,68 @@ public final class CytomineProjectSync {
 			throw e;
 		} catch (IOException e) {
 			logger.debug("No thumbnail for {}: {}", image.name(), e.getMessage());
+		}
+		return entry;
+	}
+
+	/**
+	 * Update the metadata and the tags of an entry so that they include those of the Cytomine image.
+	 * <ul>
+	 *   <li>Properties are stored under {@value #KEY_PROPERTY_PREFIX} followed by the key. Those that no longer exist
+	 *   in Cytomine are removed. Other metadata is never touched.</li>
+	 *   <li>Tags are added to the entry. The ones that were copied before and are no longer in Cytomine are removed;
+	 *   tags added in QuPath are kept.</li>
+	 * </ul>
+	 * @param metadata the metadata of the entry
+	 * @param entryTags the tags of the entry
+	 * @param cytomineTags the tags of the image in Cytomine
+	 * @param properties the properties of the image in Cytomine
+	 * @return true if anything changed
+	 */
+	static boolean mergeMetadata(Map<String, String> metadata, Set<String> entryTags, List<String> cytomineTags,
+								 List<CytomineMetadata.Property> properties) {
+		boolean changed = false;
+
+		var wanted = new LinkedHashMap<String, String>();
+		for (var property : properties)
+			wanted.merge(KEY_PROPERTY_PREFIX + property.key(), property.value(), (a, b) -> a + "; " + b);
+		for (var key : new ArrayList<>(metadata.keySet())) {
+			if (key.startsWith(KEY_PROPERTY_PREFIX) && !wanted.containsKey(key)) {
+				metadata.remove(key);
+				changed = true;
+			}
+		}
+		for (var property : wanted.entrySet()) {
+			if (!property.getValue().equals(metadata.get(property.getKey()))) {
+				metadata.put(property.getKey(), property.getValue());
+				changed = true;
+			}
+		}
+
+		var current = new LinkedHashSet<>(cytomineTags);
+		var removedInCytomine = readTags(metadata.get(KEY_PULLED_TAGS)).stream().filter(t -> !current.contains(t)).toList();
+		changed |= entryTags.removeAll(removedInCytomine);
+		changed |= entryTags.addAll(current);
+		if (current.isEmpty()) {
+			changed |= metadata.remove(KEY_PULLED_TAGS) != null;
+		} else {
+			var json = new Gson().toJson(current);
+			if (!json.equals(metadata.get(KEY_PULLED_TAGS))) {
+				metadata.put(KEY_PULLED_TAGS, json);
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	private static List<String> readTags(String json) {
+		if (json == null || json.isBlank())
+			return List.of();
+		try {
+			var tags = new Gson().fromJson(json, String[].class);
+			return tags == null ? List.of() : List.of(tags);
+		} catch (RuntimeException e) {
+			return List.of();
 		}
 	}
 

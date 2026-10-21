@@ -299,8 +299,13 @@ public class CytomineBrowser {
 	}
 
 	private static String describe(Result result) {
-		return String.format(resources.getString("browser.project.result"),
+		var summary = String.format(resources.getString("browser.project.result"),
 				result.added().size(), result.renamed(), result.removed(), result.missing().size());
+		if (result.metadataUpdated() > 0)
+			summary += "; " + String.format(resources.getString("browser.project.metadata"), result.metadataUpdated());
+		if (result.metadataFailed() > 0)
+			summary += "; " + String.format(resources.getString("browser.project.metadata.failed"), result.metadataFailed());
+		return summary;
 	}
 
 	private void importSelected() {
