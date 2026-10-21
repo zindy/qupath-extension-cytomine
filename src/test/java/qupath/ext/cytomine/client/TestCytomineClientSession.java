@@ -47,6 +47,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class TestCytomineClientSession {
 
 	private static final String USER = "alice";
+	private static final String OTHER_USER = "bob";
 
 	private HttpServer server;
 	private String coreUrl;
@@ -58,6 +59,7 @@ class TestCytomineClientSession {
 	private final AtomicInteger passwordGrants = new AtomicInteger();
 	private final AtomicInteger refreshGrants = new AtomicInteger();
 	private final AtomicInteger processedPosts = new AtomicInteger();
+	private final AtomicInteger logoutCalls = new AtomicInteger();
 
 	private volatile String serverPassword = "secret";
 	private volatile int tokenEndpointStatus = 200;
@@ -67,6 +69,7 @@ class TestCytomineClientSession {
 	void startServer() throws IOException {
 		server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
 		server.createContext("/iam/realms/cytomine/protocol/openid-connect/token", this::handleToken);
+		server.createContext("/iam/realms/cytomine/protocol/openid-connect/logout", this::handleLogout);
 		server.createContext("/api/", this::handleApi);
 		server.setExecutor(Executors.newFixedThreadPool(8));
 		server.start();
@@ -234,6 +237,73 @@ class TestCytomineClientSession {
 		assertEquals(1, passwordGrants.get());
 	}
 
+	@Test
+	void logoutEndsTheSessionOnTheServer() throws Exception {
+		var client = login();
+		assertEquals(1, validRefreshTokens.size());
+		client.logout();
+		// Done in the background
+		waitFor(() -> logoutCalls.get() == 1);
+		assertTrue(validRefreshTokens.isEmpty(), "The refresh token must not be usable any more");
+	}
+
+	@Test
+	void failedLoginDoesNotCallLogout() throws Exception {
+		assertThrows(CytomineAuthException.class,
+				() -> CytomineClient.login(coreUrl, iamUrl, USER, "nope".toCharArray()));
+		Thread.sleep(300);
+		assertEquals(0, logoutCalls.get());
+	}
+
+	@Test
+	void loggedOutClientFollowsTheNextLogin() throws Exception {
+		// e.g. the client of an image that is still open
+		var old = login();
+		old.logout();
+		assertTrue(old.needsLogin());
+
+		var fresh = login();
+		assertTrue(old.adoptSession(fresh));
+		assertFalse(old.needsLogin());
+		assertTrue(old.getJsonObject("ping.json").get("ok").getAsBoolean());
+
+		// And it is able to renew its session on its own, since it has the password
+		revokeAllTokens();
+		assertTrue(old.getJsonObject("ping.json").get("ok").getAsBoolean());
+	}
+
+	@Test
+	void clientDoesNotAdoptTheSessionOfAnotherUser() throws Exception {
+		var old = login();
+		old.logout();
+		var other = CytomineClient.login(coreUrl, iamUrl, OTHER_USER, serverPassword.toCharArray());
+		assertFalse(old.adoptSession(other));
+		assertTrue(old.needsLogin());
+		assertFalse(other.needsLogin());
+	}
+
+	@Test
+	void clientDoesNotAdoptASessionThatCannotBeRenewed() throws Exception {
+		var old = login();
+		var fresh = login();
+		fresh.logout();
+		assertFalse(old.adoptSession(fresh));
+		assertFalse(old.needsLogin());
+	}
+
+	@Test
+	void httpErrorsKeepTheirStatus() throws Exception {
+		var client = login();
+		var notFound = assertThrows(CytomineHttpException.class, () -> client.getJsonObject("missing.json"));
+		assertEquals(404, notFound.getStatusCode());
+		var failed = assertThrows(CytomineHttpException.class,
+				() -> client.sendJson("POST", "failing.json", new JsonObject()));
+		assertEquals(500, failed.getStatusCode());
+		// None of it is an authentication problem
+		assertFalse(client.needsLogin());
+		assertEquals(1, passwordGrants.get());
+	}
+
 	// ---- Fake servers
 
 	private void handleToken(HttpExchange ex) throws IOException {
@@ -249,7 +319,8 @@ class TestCytomineClientSession {
 			return;
 		}
 		if ("password".equals(grant)) {
-			if (!USER.equals(form.get("username")) || !serverPassword.equals(form.get("password"))) {
+			if (!(USER.equals(form.get("username")) || OTHER_USER.equals(form.get("username"))) ||
+					!serverPassword.equals(form.get("password"))) {
 				respond(ex, 401, "application/json",
 						"{\"error\":\"invalid_grant\",\"error_description\":\"Invalid user credentials\"}");
 				return;
@@ -275,18 +346,45 @@ class TestCytomineClientSession {
 			respond(ex, 401, "application/json", "{\"error\":\"unauthorized\"}");
 			return;
 		}
+		var path = ex.getRequestURI().getPath();
+		if (path.endsWith("/missing.json")) {
+			respond(ex, 404, "application/json", "{\"status\":404,\"message\":\"Annotation not found\"}");
+			return;
+		}
+		if (path.endsWith("/failing.json")) {
+			respond(ex, 500, "application/json", "{\"status\":500}");
+			return;
+		}
 		if ("POST".equals(ex.getRequestMethod()))
 			processedPosts.incrementAndGet();
 		respond(ex, 200, "application/json", "{\"ok\":true}");
 	}
 
+	private void handleLogout(HttpExchange ex) throws IOException {
+		var form = parseForm(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+		logoutCalls.incrementAndGet();
+		validRefreshTokens.remove(form.get("refresh_token"));
+		respond(ex, 204, "text/plain", "");
+	}
+
 	private static void respond(HttpExchange ex, int status, String type, String body) throws IOException {
 		var bytes = body.getBytes(StandardCharsets.UTF_8);
 		ex.getResponseHeaders().add("Content-Type", type);
+		if (status == 204) {
+			ex.sendResponseHeaders(status, -1);
+			ex.close();
+			return;
+		}
 		ex.sendResponseHeaders(status, bytes.length);
 		try (var out = ex.getResponseBody()) {
 			out.write(bytes);
 		}
+	}
+
+	private static void waitFor(java.util.function.BooleanSupplier condition) throws InterruptedException {
+		for (int i = 0; i < 100 && !condition.getAsBoolean(); i++)
+			Thread.sleep(50);
+		assertTrue(condition.getAsBoolean(), "Timed out");
 	}
 
 	private static Map<String, String> parseForm(String body) {

@@ -27,11 +27,16 @@ import qupath.ext.cytomine.ui.CytomineLoginDialog;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.ResourceBundle;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
@@ -55,6 +60,10 @@ public final class CytomineClients {
 	private static final ResourceBundle resources = ResourceBundle.getBundle("qupath.ext.cytomine.ui.strings");
 
 	private static final Map<String, CytomineClient> clients = new ConcurrentHashMap<>();
+
+	// Every client created for a server that is still referenced somewhere, typically by an image that is open in a
+	// viewer. The registry above only has the current one, but the others need to follow when the user logs in or out.
+	private static final Map<String, Set<CytomineClient>> knownClients = new ConcurrentHashMap<>();
 
 	private CytomineClients() {}
 
@@ -95,6 +104,15 @@ public final class CytomineClients {
 	 */
 	public static void add(CytomineClient client) {
 		var core = client.getCoreUri().toString();
+		var key = CytomineUrls.normalizeCoreUrl(core);
+		var others = knownClients(key);
+		knownClients.computeIfAbsent(key, k -> Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>())))
+				.add(client);
+		// Clients that can no longer renew their session (logged out, password refused) follow the new login
+		for (var other : others) {
+			if (other != client && other.needsLogin() && other.adoptSession(client))
+				logger.debug("Session of a previous client for {} restored", core);
+		}
 		clients.put(core, client);
 		PREFS.put(KEY_LAST_SERVER, core);
 		PREFS.put(KEY_LAST_USERNAME, client.getUsername());
@@ -102,13 +120,27 @@ public final class CytomineClients {
 	}
 
 	/**
-	 * Forget the client for a server, and the tokens and password it holds.
+	 * Log out of a server: forget the client, and the tokens and password it holds. This includes the clients used by
+	 * images that are still open, otherwise they would renew their session on their own and the user would not really
+	 * be logged out.
 	 * @param coreUrl URL of the core API
 	 */
 	public static void remove(String coreUrl) {
-		var removed = clients.remove(CytomineUrls.normalizeCoreUrl(coreUrl));
+		var key = CytomineUrls.normalizeCoreUrl(coreUrl);
+		var removed = clients.remove(key);
 		if (removed != null)
 			removed.logout();
+		for (var client : knownClients(key))
+			client.logout();
+	}
+
+	private static List<CytomineClient> knownClients(String key) {
+		var set = knownClients.get(key);
+		if (set == null)
+			return List.of();
+		synchronized (set) {
+			return new ArrayList<>(set);
+		}
 	}
 
 	/**

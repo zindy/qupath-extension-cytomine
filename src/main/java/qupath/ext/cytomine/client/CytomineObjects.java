@@ -61,10 +61,12 @@ public final class CytomineObjects {
 	 * @param depth number of z-slices
 	 * @param duration number of time points
 	 * @param bitPerSample bits per sample
+	 * @param className class name of the image on the server (used to address its tags and properties), or null
 	 */
 	public record ImageInstance(long id, long projectId, String name, int width, int height,
 								Double pixelWidthMicrons, Double pixelHeightMicrons, Double magnification,
-								int samplePerPixel, int channels, int depth, int duration, int bitPerSample) {
+								int samplePerPixel, int channels, int depth, int duration, int bitPerSample,
+								String className) {
 
 		/**
 		 * @return true if the image is stored as RGB (interleaved) rather than as separate channels
@@ -92,7 +94,8 @@ public final class CytomineObjects {
 					(int) Math.max(1, longValue(json, "channels", 1)),
 					(int) Math.max(1, longValue(json, "depth", 1)),
 					(int) Math.max(1, longValue(json, "duration", 1)),
-					(int) longValue(json, "bitPerSample", 8));
+					(int) longValue(json, "bitPerSample", 8),
+					string(json, "class"));
 		}
 
 		@Override

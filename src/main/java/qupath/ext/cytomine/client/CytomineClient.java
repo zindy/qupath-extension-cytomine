@@ -36,6 +36,7 @@ import java.time.Instant;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
@@ -70,6 +71,9 @@ public class CytomineClient {
 	private static final long LOGIN_RETRY_DELAY_MS = 1000;
 	// ...then requests fail immediately for a while, instead of each pending tile request waiting for the same retries
 	private static final Duration LOGIN_FAILURE_COOLDOWN = Duration.ofSeconds(15);
+	// Short, because QuPath may be waiting for a login (e.g. to build an image server) on the JavaFX thread
+	private static final Duration TOKEN_REQUEST_TIMEOUT = Duration.ofSeconds(10);
+	private static final Duration LOGOUT_REQUEST_TIMEOUT = Duration.ofSeconds(5);
 
 	private final java.util.concurrent.Semaphore requestPermits = new java.util.concurrent.Semaphore(MAX_CONCURRENT_REQUESTS);
 
@@ -151,14 +155,84 @@ public class CytomineClient {
 	}
 
 	/**
-	 * Forget the tokens and the password. Requests made afterwards fail with a {@link CytomineAuthException}.
+	 * Forget the tokens and the password, and end the session on the server (in the background, and on a best effort
+	 * basis: failing to reach the server does not matter, the tokens expire anyway).
+	 * Requests made afterwards fail with a {@link CytomineAuthException}.
 	 */
-	public synchronized void logout() {
-		wipePassword();
-		accessToken = null;
-		refreshToken = null;
-		accessExpiry = Instant.MIN;
-		refreshExpiry = Instant.MIN;
+	public void logout() {
+		String tokenToRevoke;
+		synchronized (this) {
+			tokenToRevoke = refreshToken;
+			wipePassword();
+			accessToken = null;
+			refreshToken = null;
+			accessExpiry = Instant.MIN;
+			refreshExpiry = Instant.MIN;
+		}
+		if (tokenToRevoke != null)
+			endServerSession(tokenToRevoke);
+	}
+
+	private void endServerSession(String refreshTokenToRevoke) {
+		try {
+			var body = "client_id=" + URLEncoder.encode(clientId, StandardCharsets.UTF_8) +
+					"&refresh_token=" + URLEncoder.encode(refreshTokenToRevoke, StandardCharsets.UTF_8);
+			var request = HttpRequest.newBuilder(URI.create(iamUri + "/protocol/openid-connect/logout"))
+					.timeout(LOGOUT_REQUEST_TIMEOUT)
+					.header("Content-Type", "application/x-www-form-urlencoded")
+					.POST(HttpRequest.BodyPublishers.ofString(body))
+					.build();
+			http.sendAsync(request, HttpResponse.BodyHandlers.discarding()).whenComplete((response, error) -> {
+				if (error != null)
+					logger.debug("Unable to end the Cytomine session on the server: {}", error.toString());
+				else if (response.statusCode() / 100 != 2)
+					logger.debug("Ending the Cytomine session returned HTTP {}", response.statusCode());
+			});
+		} catch (RuntimeException e) {
+			logger.debug("Unable to end the Cytomine session on the server: {}", e.toString());
+		}
+	}
+
+	/**
+	 * Take over the session of another client of the same server and user. Used when the user logs in again: images
+	 * that are still open hold a client that was logged out (or whose password was refused), and would otherwise stay
+	 * broken until they are reopened.
+	 * @param other the client that has just logged in
+	 * @return false if the other client is not for the same server and user, in which case nothing changes
+	 */
+	boolean adoptSession(CytomineClient other) {
+		if (other == this || !coreUri.equals(other.coreUri) || !iamUri.equals(other.iamUri))
+			return false;
+		char[] newPassword;
+		String newUsername, newAccessToken, newRefreshToken;
+		Instant newAccessExpiry, newRefreshExpiry;
+		// Never hold both locks at once
+		synchronized (other) {
+			if (other.password == null)
+				return false;
+			newPassword = other.password.clone();
+			newUsername = other.username;
+			newAccessToken = other.accessToken;
+			newRefreshToken = other.refreshToken;
+			newAccessExpiry = other.accessExpiry;
+			newRefreshExpiry = other.refreshExpiry;
+		}
+		synchronized (this) {
+			if (!Objects.equals(username, newUsername)) {
+				Arrays.fill(newPassword, '\0');
+				return false;
+			}
+			wipePassword();
+			password = newPassword;
+			accessToken = newAccessToken;
+			refreshToken = newRefreshToken;
+			accessExpiry = newAccessExpiry;
+			refreshExpiry = newRefreshExpiry;
+			lastLoginFailure = null;
+			lastLoginFailureTime = Instant.MIN;
+			authFailureReported.set(false);
+		}
+		return true;
 	}
 
 	/**
@@ -222,7 +296,7 @@ public class CytomineClient {
 				.method(method, publisher)
 				.build(), HttpResponse.BodyHandlers.ofString());
 		if (response.statusCode() / 100 != 2)
-			throw new IOException("HTTP " + response.statusCode() + " for " + method + " " + uri);
+			throw new CytomineHttpException(response.statusCode(), "HTTP " + response.statusCode() + " for " + method + " " + uri);
 		var text = response.body();
 		if (text == null || text.isBlank())
 			return new JsonObject();
@@ -275,7 +349,7 @@ public class CytomineClient {
 				int status = response.statusCode();
 				if (status / 100 == 2)
 					return response.body();
-				lastError = new IOException("HTTP " + status + " for " + uri);
+				lastError = new CytomineHttpException(status, "HTTP " + status + " for " + uri);
 				// Client errors will not go away by retrying
 				if (status / 100 == 4 && status != 408 && status != 429)
 					throw lastError;
@@ -408,7 +482,7 @@ public class CytomineClient {
 					.append(URLEncoder.encode(v, StandardCharsets.UTF_8));
 		});
 		var request = HttpRequest.newBuilder(URI.create(iamUri + "/protocol/openid-connect/token"))
-				.timeout(Duration.ofSeconds(30))
+				.timeout(TOKEN_REQUEST_TIMEOUT)
 				.header("Content-Type", "application/x-www-form-urlencoded")
 				.POST(HttpRequest.BodyPublishers.ofString(body.toString()))
 				.build();

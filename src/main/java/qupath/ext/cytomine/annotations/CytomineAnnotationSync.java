@@ -23,6 +23,7 @@ import qupath.ext.cytomine.client.CytomineAnnotations.RemoteAnnotation;
 import qupath.ext.cytomine.client.CytomineAnnotations.Term;
 import qupath.ext.cytomine.client.CytomineAuthException;
 import qupath.ext.cytomine.client.CytomineClient;
+import qupath.ext.cytomine.client.CytomineHttpException;
 import qupath.ext.cytomine.client.CytomineObjects;
 import qupath.ext.cytomine.client.CytomineUrls;
 import qupath.lib.images.ImageData;
@@ -224,43 +225,57 @@ public class CytomineAnnotationSync {
 		var synced = new LinkedHashSet<Long>();
 		var plane = ImagePlane.getDefaultPlane();
 
-		for (var obj : new ArrayList<>(imageData.getHierarchy().getAnnotationObjects())) {
-			if (obj.getROI() == null || !isMine(obj))
-				continue;
-			try {
-				var idText = obj.getMetadata().get(KEY_ID);
-				if (idText == null) {
-					synced.add(createRemote(obj, report));
+		try {
+			for (var obj : new ArrayList<>(imageData.getHierarchy().getAnnotationObjects())) {
+				if (obj.getROI() == null || !isMine(obj))
+					continue;
+				try {
+					var idText = obj.getMetadata().get(KEY_ID);
+					if (idText == null) {
+						synced.add(createRemote(obj, report));
+						continue;
+					}
+					long id = Long.parseLong(idText);
+					synced.add(id);
+					if (isModified(obj))
+						updateRemote(obj, id, report);
+				} catch (CytomineAuthException e) {
+					throw e;
+				} catch (IOException | RuntimeException e) {
+					report.warnings.add(describe(obj) + ": " + e.getMessage());
+				}
+			}
+
+			for (long id : previouslySynced) {
+				if (synced.contains(id))
+					continue;
+				if (!deleteRemoved) {
+					// Keep tracking it, so that it can be deleted later
 					continue;
 				}
-				long id = Long.parseLong(idText);
-				synced.add(id);
-				if (isModified(obj))
-					updateRemote(obj, id, report);
-			} catch (CytomineAuthException e) {
-				throw e;
-			} catch (IOException | RuntimeException e) {
-				report.warnings.add(describe(obj) + ": " + e.getMessage());
-			}
-		}
-
-		for (long id : previouslySynced) {
-			if (synced.contains(id))
-				continue;
-			if (!deleteRemoved) {
-				// Keep tracking it, so that it can be deleted later
-				continue;
-			}
-			try {
-				if (CytomineAnnotations.get(client, id).userId() == userId) {
-					CytomineAnnotations.delete(client, id);
-					report.deleted++;
+				try {
+					if (CytomineAnnotations.get(client, id).userId() == userId) {
+						CytomineAnnotations.delete(client, id);
+						report.deleted++;
+					}
+				} catch (CytomineAuthException e) {
+					throw e;
+				} catch (CytomineHttpException e) {
+					// 404: already deleted in Cytomine, nothing left to do (and it stops being tracked)
+					if (e.getStatusCode() != 404)
+						report.warnings.add("Annotation " + id + " could not be deleted: " + e.getMessage());
+				} catch (IOException e) {
+					report.warnings.add("Annotation " + id + " could not be deleted: " + e.getMessage());
 				}
-			} catch (CytomineAuthException e) {
-				throw e;
-			} catch (IOException e) {
-				report.warnings.add("Annotation " + id + " could not be deleted: " + e.getMessage());
 			}
+		} catch (IOException | RuntimeException e) {
+			// Aborted, e.g. because the session could not be renewed. The annotations created so far must stay tracked
+			// (they already carry their Cytomine id), and nothing that was tracked before is forgotten.
+			var tracked = new LinkedHashSet<>(previouslySynced);
+			tracked.addAll(synced);
+			saveSyncedIds(tracked);
+			imageData.setChanged(true);
+			throw e;
 		}
 		if (!deleteRemoved)
 			synced.addAll(previouslySynced.stream().filter(id -> !synced.contains(id)).toList());
@@ -282,10 +297,11 @@ public class CytomineAnnotationSync {
 		RemoteAnnotation remote;
 		try {
 			remote = CytomineAnnotations.get(client, id);
-		} catch (CytomineAuthException e) {
-			// Not the same thing as an annotation deleted in Cytomine
-			throw e;
-		} catch (IOException e) {
+		} catch (CytomineHttpException e) {
+			// Any other problem (server error, timeout, authentication...) is not the same thing as an annotation that
+			// was deleted in Cytomine, and is reported as such by the caller
+			if (e.getStatusCode() != 404)
+				throw e;
 			report.conflicts.add(describe(obj) + " no longer exists in Cytomine (pull to refresh)");
 			return;
 		}
