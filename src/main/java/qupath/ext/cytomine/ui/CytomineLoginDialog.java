@@ -80,6 +80,9 @@ public final class CytomineLoginDialog {
 		serverField.setPrefColumnCount(28);
 
 		var dialog = new Dialog<CytomineClient>();
+		// Without a converter, JavaFX uses the clicked ButtonType as the result when the dialog is cancelled or closed,
+		// which fails with a ClassCastException as soon as the caller reads the (supposed) client
+		dialog.setResultConverter(buttonType -> null);
 		var qupath = QuPathGUI.getInstance();
 		if (qupath != null)
 			dialog.initOwner(qupath.getStage());

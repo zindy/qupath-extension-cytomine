@@ -44,7 +44,8 @@ public class CytomineImageServerBuilder implements ImageServerBuilder<BufferedIm
 		if (!CytomineUrls.isImageUri(uri))
 			return null;
 		var client = CytomineClients.getOrLogin(CytomineUrls.coreUrl(uri))
-				.orElseThrow(() -> new IOException("Not logged in to " + uri.getAuthority()));
+				.orElseThrow(() -> new IOException("Login to " + uri.getAuthority() +
+						" cancelled: the image cannot be opened without logging in"));
 		return new CytomineImageServer(uri, client, args);
 	}
 
